@@ -2518,8 +2518,102 @@ function applyPendingChanges(owner, folderId, receiptId) {
  * @param {string} receiptId
  * @returns {string}
  */
+/**
+ * Encodes data needed to share a receipt or an entire folder into a base64 token.
+ * The format depends on whether a specific receipt is shared or the whole
+ * folder. For backward compatibility, if receiptId is not provided or
+ * older logic is desired, the function can still return a simple
+ * pipe‑separated string. In the new snapshot format, the token is a
+ * base64‑encoded JSON object containing all necessary data so that
+ * the share link can be opened without the owner’s account existing on
+ * the recipient’s machine. The snapshot includes the owner name to
+ * allow pending modifications to be keyed properly, but no other user
+ * data is required to view the receipt or folder.
+ *
+ * @param {string} owner        The username of the owner creating the link.
+ * @param {string} folderId     The ID of the folder being shared.
+ * @param {string} receiptId    The ID of the receipt to share, or 'folder'
+ *                              to share the whole folder. If undefined,
+ *                              defaults to sharing the folder.
+ * @returns {string}            A base64 encoded token representing the share.
+ */
 function encodeShareData(owner, folderId, receiptId) {
-  return btoa(`${owner}|${folderId}|${receiptId}`);
+  // Load latest data to ensure snapshots reflect current state
+  loadData();
+  migrateData();
+  const ownerData = data.users[owner];
+  if (!ownerData) {
+    // Fallback to old behaviour if owner data is missing
+    return btoa(`${owner}|${folderId}|${receiptId}`);
+  }
+  const folder = ownerData.folders[folderId];
+  if (!folder) {
+    return btoa(`${owner}|${folderId}|${receiptId}`);
+  }
+  // When sharing an entire folder, include all receipts and people in the snapshot
+  if (receiptId === 'folder' || typeof receiptId === 'undefined') {
+    const snapshot = {
+      type: 'folder',
+      owner: owner,
+      folderId: folderId,
+      folderName: folder.name,
+      people: folder.people.map(p => ({ name: p.name, prefs: p.prefs || {} })),
+      receipts: folder.receipts.map(r => {
+        return {
+          id: r.id,
+          name: r.name,
+          payer: r.payer,
+          currency: r.currency,
+          rate: r.rate,
+          rateDate: r.rateDate,
+          extraColumns: r.extraColumns ? JSON.parse(JSON.stringify(r.extraColumns)) : [],
+          items: r.items.map(it => {
+            return {
+              name: it.name,
+              qty: it.qty,
+              unitPrice: it.unitPrice,
+              total: it.total,
+              extras: it.extras ? JSON.parse(JSON.stringify(it.extras)) : {},
+              assigned: it.assigned ? it.assigned.slice() : undefined
+            };
+          })
+        };
+      })
+    };
+    return btoa(JSON.stringify(snapshot));
+  }
+  // Sharing a single receipt: include the specific receipt and people
+  const receipt = folder.receipts.find(r => r.id === receiptId);
+  if (!receipt) {
+    return btoa(`${owner}|${folderId}|${receiptId}`);
+  }
+  const snapshot = {
+    type: 'receipt',
+    owner: owner,
+    folderId: folderId,
+    receiptId: receiptId,
+    receipt: {
+      id: receipt.id,
+      name: receipt.name,
+      payer: receipt.payer,
+      currency: receipt.currency,
+      rate: receipt.rate,
+      rateDate: receipt.rateDate,
+      extraColumns: receipt.extraColumns ? JSON.parse(JSON.stringify(receipt.extraColumns)) : [],
+      items: receipt.items.map(it => {
+        return {
+          name: it.name,
+          qty: it.qty,
+          unitPrice: it.unitPrice,
+          total: it.total,
+          extras: it.extras ? JSON.parse(JSON.stringify(it.extras)) : {},
+          assigned: it.assigned ? it.assigned.slice() : undefined
+        };
+      })
+    },
+    people: folder.people.map(p => ({ name: p.name, prefs: p.prefs || {} }))
+  };
+  return btoa(JSON.stringify(snapshot));
 }
 
 /**
@@ -2531,6 +2625,16 @@ function encodeShareData(owner, folderId, receiptId) {
 function decodeShareData(token) {
   try {
     const decoded = atob(token);
+    // New format: JSON snapshot begins with '{'.
+    if (decoded && decoded.trim().startsWith('{')) {
+      try {
+        const obj = JSON.parse(decoded);
+        return obj;
+      } catch (e) {
+        // fall through to old format
+      }
+    }
+    // Old format: pipe‑separated owner|folderId|receiptId
     const parts = decoded.split('|');
     if (parts.length === 3) {
       return { owner: parts[0], folderId: parts[1], receiptId: parts[2] };
@@ -2554,6 +2658,23 @@ function loadShareView(token) {
   const info = decodeShareData(token);
   if (!info) {
     alert('Ungültiger oder beschädigter Link.');
+    return;
+  }
+  // If the info object contains a "type" property, this is a JSON snapshot
+  // created by the new share mechanism. Delegate handling to snapshot
+  // specific functions. If no type is present, fall back to the old logic
+  // using owner/folderId/receiptId references.
+  if (info && typeof info === 'object' && info.type) {
+    if (info.type === 'folder') {
+      loadFolderSnapshotView(info);
+      return;
+    }
+    if (info.type === 'receipt') {
+      loadReceiptSnapshotView(info);
+      return;
+    }
+    // Unknown type
+    alert('Unbekannter Freigabetyp.');
     return;
   }
   const { owner, folderId, receiptId } = info;
@@ -2848,5 +2969,304 @@ function loadFolderShareView(owner, folderId) {
     submit.disabled = true;
   });
   container.appendChild(submit);
+  document.body.appendChild(container);
+}
+
+/**
+ * Loads a receipt share view based on a snapshot object. This mode is
+ * triggered when a share link contains a JSON snapshot of a single
+ * receipt rather than just a reference. The view allows a friend to
+ * select their name and assign themselves to items without relying
+ * on the owner's account existing in local storage.
+ * @param {Object} info A snapshot object with type 'receipt'.
+ */
+function loadReceiptSnapshotView(info) {
+  isShareView = true;
+  // Hide normal UI sections
+  if (authSection) authSection.classList.add('hidden');
+  if (appSection) appSection.classList.add('hidden');
+  // Remove any existing share view
+  const prev = document.getElementById('share-view');
+  if (prev) prev.remove();
+  // Extract data from snapshot
+  const people = Array.isArray(info.people) ? info.people : [];
+  const receipt = info.receipt;
+  if (!receipt) {
+    alert('Ungültiger Freigabelink (kein Kassenbon).');
+    return;
+  }
+  // Build share interface
+  const container = document.createElement('div');
+  container.id = 'share-view';
+  container.style.padding = '1rem';
+  container.style.maxWidth = '900px';
+  container.style.margin = '0 auto';
+  // Heading
+  const heading = document.createElement('h3');
+  heading.textContent = 'Kassenbon teilen: ' + receipt.name;
+  container.appendChild(heading);
+  // Person selection
+  const lbl = document.createElement('label');
+  lbl.textContent = 'Ich bin: ';
+  const sel = document.createElement('select');
+  people.forEach((p, idx) => {
+    const opt = document.createElement('option');
+    opt.value = idx;
+    opt.textContent = p.name;
+    sel.appendChild(opt);
+  });
+  if (people.length === 0) {
+    const opt = document.createElement('option');
+    opt.value = 0;
+    opt.textContent = 'Gast';
+    sel.appendChild(opt);
+  }
+  lbl.appendChild(sel);
+  container.appendChild(lbl);
+  // Table
+  const table = document.createElement('table');
+  let currentAssignments = [];
+  function rebuildTable(selectedIdx) {
+    table.innerHTML = '';
+    const headerRow = document.createElement('tr');
+    ['Artikel','Menge','Einzelpreis','Gesamt','Ich'].forEach(h => {
+      const th = document.createElement('th');
+      th.textContent = h;
+      headerRow.appendChild(th);
+    });
+    table.appendChild(headerRow);
+    receipt.items.forEach((it, i) => {
+      const row = document.createElement('tr');
+      const tdName = document.createElement('td');
+      tdName.textContent = it.name;
+      row.appendChild(tdName);
+      const tdQty = document.createElement('td');
+      tdQty.textContent = typeof it.qty === 'number' ? it.qty.toString() : '';
+      row.appendChild(tdQty);
+      const tdUnit = document.createElement('td');
+      tdUnit.textContent = typeof it.unitPrice === 'number' ? it.unitPrice.toFixed(2) : '';
+      row.appendChild(tdUnit);
+      const tdTotal = document.createElement('td');
+      let totalVal;
+      if (typeof it.unitPrice === 'number' && typeof it.qty === 'number') {
+        totalVal = it.unitPrice * it.qty;
+      } else if (typeof it.total === 'number') {
+        totalVal = it.total;
+      }
+      tdTotal.textContent = totalVal !== undefined ? totalVal.toFixed(2) : '';
+      row.appendChild(tdTotal);
+      const tdCheck = document.createElement('td');
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      // Determine original assignment if present
+      let orig = false;
+      if (Array.isArray(it.assigned) && selectedIdx < it.assigned.length) {
+        orig = !!it.assigned[selectedIdx];
+      }
+      cb.checked = currentAssignments[i] !== undefined ? currentAssignments[i] : orig;
+      cb.addEventListener('change', (ev) => {
+        currentAssignments[i] = ev.target.checked;
+      });
+      tdCheck.appendChild(cb);
+      row.appendChild(tdCheck);
+      table.appendChild(row);
+    });
+  }
+  // Initial build
+  rebuildTable(parseInt(sel.value) || 0);
+  sel.addEventListener('change', () => {
+    currentAssignments = [];
+    rebuildTable(parseInt(sel.value) || 0);
+  });
+  container.appendChild(table);
+  // Submit button
+  const submit = document.createElement('button');
+  submit.textContent = 'Änderungen speichern';
+  submit.className = 'secondary-button';
+  submit.style.marginTop = '1rem';
+  submit.addEventListener('click', () => {
+    // Compute pending assignments relative to original snapshot
+    const selIdx = parseInt(sel.value) || 0;
+    const pending = [];
+    receipt.items.forEach((it, idx) => {
+      let orig = false;
+      if (Array.isArray(it.assigned) && selIdx < it.assigned.length) {
+        orig = !!it.assigned[selIdx];
+      }
+      const newVal = currentAssignments[idx] !== undefined ? !!currentAssignments[idx] : orig;
+      if (newVal !== orig) {
+        pending.push({ itemIndex: idx, personIndex: selIdx, assigned: newVal });
+      }
+    });
+    if (pending.length === 0) {
+      alert('Keine Änderungen vorgenommen.');
+      return;
+    }
+    // Store pending changes locally keyed by owner and receipt id if possible
+    if (info.owner && receipt.id) {
+      addPendingChange(info.owner, receipt.id, pending);
+    }
+    alert('Danke! Deine Änderungen wurden gespeichert. Sie müssen noch bestätigt werden.');
+    submit.disabled = true;
+  });
+  container.appendChild(submit);
+  document.body.appendChild(container);
+}
+
+/**
+ * Loads a folder share view based on a snapshot object. This mode is
+ * triggered when a share link contains a JSON snapshot of an entire
+ * folder. The view allows a friend to select their name and assign
+ * themselves to items across all receipts without relying on the
+ * owner’s account existing locally.
+ * @param {Object} info A snapshot object with type 'folder'.
+ */
+function loadFolderSnapshotView(info) {
+  isShareView = true;
+  // Hide normal UI sections
+  if (authSection) authSection.classList.add('hidden');
+  if (appSection) appSection.classList.add('hidden');
+  // Remove any existing share view
+  const prev = document.getElementById('share-view');
+  if (prev) prev.remove();
+  const people = Array.isArray(info.people) ? info.people : [];
+  const receipts = Array.isArray(info.receipts) ? info.receipts : [];
+  const folderName = info.folderName || 'Ordner';
+  // Build share interface
+  const container = document.createElement('div');
+  container.id = 'share-view';
+  container.style.padding = '1rem';
+  container.style.maxWidth = '900px';
+  container.style.margin = '0 auto';
+  // Heading
+  const heading = document.createElement('h3');
+  heading.textContent = 'Ordner teilen: ' + folderName;
+  container.appendChild(heading);
+  // Person selection
+  const lbl = document.createElement('label');
+  lbl.textContent = 'Ich bin: ';
+  const sel = document.createElement('select');
+  people.forEach((p, idx) => {
+    const opt = document.createElement('option');
+    opt.value = idx;
+    opt.textContent = p.name;
+    sel.appendChild(opt);
+  });
+  if (people.length === 0) {
+    const opt = document.createElement('option');
+    opt.value = 0;
+    opt.textContent = 'Gast';
+    sel.appendChild(opt);
+  }
+  lbl.appendChild(sel);
+  container.appendChild(lbl);
+  // Maintain assignment state for each receipt separately
+  const assignments = {};
+  // Function to rebuild tables for each receipt based on selected person
+  function rebuildAllTables() {
+    // Remove previous receipt sections
+    const prevSecs = container.querySelectorAll('.receipt-share');
+    prevSecs.forEach(el => el.remove());
+    const selectedIdx = parseInt(sel.value) || 0;
+    receipts.forEach(rec => {
+      // Section container
+      const sec = document.createElement('div');
+      sec.className = 'receipt-share';
+      sec.style.marginTop = '1rem';
+      // Heading for this receipt
+      const h4 = document.createElement('h4');
+      h4.textContent = rec.name;
+      sec.appendChild(h4);
+      // Table
+      const tbl = document.createElement('table');
+      const headerRow = document.createElement('tr');
+      ['Artikel','Menge','Einzelpreis','Gesamt','Ich'].forEach(h => {
+        const th = document.createElement('th');
+        th.textContent = h;
+        headerRow.appendChild(th);
+      });
+      tbl.appendChild(headerRow);
+      if (!assignments[rec.id]) assignments[rec.id] = [];
+      rec.items.forEach((it, idx) => {
+        const row = document.createElement('tr');
+        const tdName = document.createElement('td');
+        tdName.textContent = it.name;
+        row.appendChild(tdName);
+        const tdQty = document.createElement('td');
+        tdQty.textContent = typeof it.qty === 'number' ? it.qty.toString() : '';
+        row.appendChild(tdQty);
+        const tdUnit = document.createElement('td');
+        tdUnit.textContent = typeof it.unitPrice === 'number' ? it.unitPrice.toFixed(2) : '';
+        row.appendChild(tdUnit);
+        const tdTotal = document.createElement('td');
+        let totalVal;
+        if (typeof it.unitPrice === 'number' && typeof it.qty === 'number') {
+          totalVal = it.unitPrice * it.qty;
+        } else if (typeof it.total === 'number') {
+          totalVal = it.total;
+        }
+        tdTotal.textContent = totalVal !== undefined ? totalVal.toFixed(2) : '';
+        row.appendChild(tdTotal);
+        const tdCheck = document.createElement('td');
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        // Determine original assignment
+        let orig = false;
+        if (Array.isArray(it.assigned) && selectedIdx < it.assigned.length) {
+          orig = !!it.assigned[selectedIdx];
+        }
+        cb.checked = assignments[rec.id][idx] !== undefined ? assignments[rec.id][idx] : orig;
+        cb.addEventListener('change', (ev) => {
+          assignments[rec.id][idx] = ev.target.checked;
+        });
+        tdCheck.appendChild(cb);
+        row.appendChild(tdCheck);
+        tbl.appendChild(row);
+      });
+      sec.appendChild(tbl);
+      container.appendChild(sec);
+    });
+  }
+  // Initial tables
+  rebuildAllTables();
+  sel.addEventListener('change', () => {
+    rebuildAllTables();
+  });
+  // Save button
+  const saveBtn = document.createElement('button');
+  saveBtn.textContent = 'Änderungen speichern';
+  saveBtn.className = 'secondary-button';
+  saveBtn.style.marginTop = '1rem';
+  saveBtn.addEventListener('click', () => {
+    const selectedIdx = parseInt(sel.value) || 0;
+    let anyChanges = false;
+    receipts.forEach(rec => {
+      const recAssignments = assignments[rec.id] || [];
+      const pending = [];
+      rec.items.forEach((it, idx) => {
+        let orig = false;
+        if (Array.isArray(it.assigned) && selectedIdx < it.assigned.length) {
+          orig = !!it.assigned[selectedIdx];
+        }
+        const newVal = recAssignments[idx] !== undefined ? !!recAssignments[idx] : orig;
+        if (newVal !== orig) {
+          pending.push({ itemIndex: idx, personIndex: selectedIdx, assigned: newVal });
+        }
+      });
+      if (pending.length > 0) {
+        anyChanges = true;
+        if (info.owner && rec.id) {
+          addPendingChange(info.owner, rec.id, pending);
+        }
+      }
+    });
+    if (!anyChanges) {
+      alert('Keine Änderungen vorgenommen.');
+      return;
+    }
+    alert('Danke! Deine Änderungen wurden gespeichert. Sie müssen noch bestätigt werden.');
+    saveBtn.disabled = true;
+  });
+  container.appendChild(saveBtn);
   document.body.appendChild(container);
 }
